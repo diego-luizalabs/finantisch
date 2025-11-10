@@ -1,4 +1,3 @@
-// server.js COMPLETO E CORRIGIDO 🐷
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -15,7 +14,7 @@ const PORT = process.env.PORT || 3000;
 const { GRAPH_API_TOKEN, PHONE_NUMBER_ID, GRAPH_API_VERSION, WEBHOOK_VERIFY_TOKEN } = process.env;
 
 // =========================================
-// FUNÇÃO DE ENVIO (META API)
+// FUNÇÃO AUXILIAR: ENVIO DE MENSAGEM
 // =========================================
 async function sendMessage(to, text) {
     try {
@@ -32,11 +31,9 @@ async function sendMessage(to, text) {
                 text: { body: text }
             }
         });
-        // Registrar envio no banco (opcional, mas bom para histórico)
+        // Log opcional no banco
         db.get("SELECT id FROM leads WHERE phone = ?", [to], (err, row) => {
-            if (row) {
-                db.run("INSERT INTO messages (lead_id, type, body) VALUES (?, 'sent', ?)", [row.id, text]);
-            }
+            if (row) db.run("INSERT INTO messages (lead_id, type, body) VALUES (?, 'sent', ?)", [row.id, text]);
         });
     } catch (error) {
         console.error('❌ Erro ao enviar mensagem:', error.response ? error.response.data : error.message);
@@ -44,117 +41,97 @@ async function sendMessage(to, text) {
 }
 
 // =========================================
-// 🤖 CHATBOT FINANCEIRO (O COFRINHO)
+// 🐷 BOT FINANCEIRO (LÓGICA PRINCIPAL)
 // =========================================
 async function handleChatbot(from, msgBody, leadName) {
     msgBody = msgBody.trim();
     const lowerMsg = msgBody.toLowerCase();
 
-    // 1. Primeiro, garante que temos o ID desse usuário no banco
+    // 1. Identifica o usuário no banco
     db.get("SELECT id FROM leads WHERE phone = ?", [from], async (err, lead) => {
-        if (err || !lead) {
-            console.error("Erro ao encontrar lead para o bot:", err);
-            return;
-        }
+        if (err || !lead) return;
 
         let response = "";
 
-        // --- COMANDO: CONTROLE (Adicionar gasto) ---
-        // Ex: "controle 50 mercado"
+        // --- COMANDO: CONTROLE (ADICIONAR) ---
         if (lowerMsg.startsWith('controle ')) {
             const parts = msgBody.split(' ');
-            // Tenta pegar o valor (substitui vírgula por ponto se o usuário usar)
-            const valorStr = parts[1] ? parts[1].replace(',', '.') : '0';
-            const valor = parseFloat(valorStr);
-            // Pega o resto da frase como categoria
+            const valor = parseFloat(parts[1] ? parts[1].replace(',', '.') : '0');
             const categoria = parts.slice(2).join(' ') || 'geral';
 
             if (isNaN(valor) || valor <= 0) {
-                response = "❌ Valor inválido.\n\nUse assim:\n*controle 50 mercado*\n*controle 10.50 padaria*";
+                response = "❌ *Valor inválido.*\nUse: _controle 50.00 mercado_";
             } else {
-                // Salva no banco
                 db.run(`INSERT INTO transactions (lead_id, amount, category) VALUES (?, ?, ?)`, 
-                    [lead.id, valor, categoria], 
-                    function (err) { // Usando 'function' normal para ter acesso ao 'this.lastID'
+                    [lead.id, valor, categoria], function (err) {
                         if (!err) {
-                            const novoID = this.lastID;
-                            sendMessage(from, `✅ *Salvo!* (ID: ${novoID})\n💰 R$${valor.toFixed(2)}\n📂 ${categoria}`);
+                            sendMessage(from, `✅ *Registrado!*\n🆔 ID: ${this.lastID}\n💰 R$${valor.toFixed(2)}\n📂 ${categoria}`);
                         } else {
-                            sendMessage(from, "❌ Erro ao salvar no cofrinho. Tente de novo.");
+                            sendMessage(from, "❌ Erro ao salvar. Tente novamente.");
                         }
-                    }
-                );
-                return; // Retorna aqui para não enviar response duplicado
+                    });
+                return;
             }
 
-        // --- COMANDO: EXTRATO ---
+        // --- COMANDO: EXTRATO (SALDO) ---
         } else if (['extrato', 'saldo', 'ver', 'total'].includes(lowerMsg)) {
-            // 1. Pega o total
+            // Calcula Total
             db.get("SELECT SUM(amount) as total FROM transactions WHERE lead_id = ?", [lead.id], (err, resTotal) => {
                 const total = resTotal && resTotal.total ? resTotal.total : 0;
                 
-                // 2. Pega os últimos 5 lançamentos
-                db.all("SELECT id, amount, category, created_at FROM transactions WHERE lead_id = ? ORDER BY id DESC LIMIT 5", [lead.id], async (err, rows) => {
-                    let msg = `🐷 *SEU COFRINHO*\n\n💰 *TOTAL: R$${total.toFixed(2)}*\n\n📋 *Últimos lançamentos:*\n`;
+                // Busca últimos 10 lançamentos
+                db.all("SELECT id, amount, category, created_at FROM transactions WHERE lead_id = ? ORDER BY id DESC LIMIT 10", [lead.id], async (err, rows) => {
+                    let msg = `🐷 *EXTRATO FINANCEIRO*\n\n💰 *SALDO TOTAL: R$${total.toFixed(2)}*\n──────────────────\n`;
                     
                     if (rows.length > 0) {
                         rows.forEach(t => {
-                             // Formata a data rapidinho (dd/mm hh:mm)
-                             const data = new Date(t.created_at);
-                             const dataFormatada = `${data.getDate()}/${data.getMonth()+1} ${data.getHours()}:${String(data.getMinutes()).padStart(2, '0')}`;
-                             msg += `🆔${t.id} | R$${t.amount.toFixed(2)} - ${t.category}\n`; // \nAdd data se quiser: (${dataFormatada})
+                            // Formatação de Data BR (Gambiarra funcional para SQLite UTC)
+                            // Assume que o servidor salva em UTC. Adiciona 'Z' para o JS entender que é UTC.
+                            let dataBR = '---';
+                            try {
+                                const dataUTC = new Date(t.created_at.replace(' ', 'T') + 'Z');
+                                dataBR = dataUTC.toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' });
+                            } catch (e) { dataBR = t.created_at; } // Fallback se der erro na data
+
+                            msg += `🆔*${t.id}* | R$${t.amount.toFixed(2)}\n📂 ${t.category} | 🕒 ${dataBR}\n\n`;
                         });
                     } else {
-                        msg += "(Nenhum lançamento ainda)";
+                        msg += "(Nenhum lançamento ainda)\n";
                     }
-
-                    msg += `\n\n💡 _Para apagar algo, use: *excluir [ID]*_`;
+                    msg += `💡 _Para apagar: *excluir [ID]*_`;
                     await sendMessage(from, msg);
                 });
             });
             return;
 
         // --- COMANDO: EXCLUIR ---
-        // Ex: "excluir 32"
         } else if (lowerMsg.startsWith('excluir ')) {
-            const idParaExcluir = parseInt(lowerMsg.split(' ')[1]);
-
-            if (!isNaN(idParaExcluir)) {
-                db.run("DELETE FROM transactions WHERE id = ? AND lead_id = ?", [idParaExcluir, lead.id], function(err) {
-                    if (this.changes > 0) {
-                        sendMessage(from, `🗑️ Transação *ID ${idParaExcluir}* excluída.`);
-                    } else {
-                        sendMessage(from, `⚠️ Não encontrei a transação *ID ${idParaExcluir}* ou ela não é sua.`);
-                    }
+            const idExcluir = parseInt(lowerMsg.split(' ')[1]);
+            if (!isNaN(idExcluir)) {
+                db.run("DELETE FROM transactions WHERE id = ? AND lead_id = ?", [idExcluir, lead.id], function(err) {
+                    if (this.changes > 0) sendMessage(from, `🗑️ Lançamento *ID ${idExcluir}* apagado!`);
+                    else sendMessage(from, `⚠️ ID ${idExcluir} não encontrado.`);
                 });
+                return;
             } else {
-                 response = "❌ Use: *excluir [número do ID]*\nEx: _excluir 15_";
+                response = "❌ Use: *excluir [NÚMERO DO ID]*";
             }
-            if (response) await sendMessage(from, response);
-            return;
 
-        // --- MENU INICIAL / BOAS VINDAS ---
+        // --- MENU PADRÃO ---
         } else {
-            response = `Olá ${leadName || ''}! 👋\nEu sou seu Bot Financeiro 🐷.\n\n*Comandos que entendo:*\n\n🆕 *controle [valor] [categoria]*\n_(Ex: controle 50 pizza)_\n\n📊 *extrato*\n_(Ver seu saldo e últimos gastos)_\n\n❌ *excluir [ID]*\n_(Apaga um lançamento errado)_`;
+            response = `🐷 *Bot Financeiro*\nOlá ${leadName}! Seus comandos:\n\n🆕 *controle [valor] [descrição]*\n_(Ex: controle 100 jantar fora)_\n\n📊 *extrato*\n_(Ver saldo e histórico)_\n\n❌ *excluir [ID]*\n_(Apagar um registro)_`;
         }
 
-        // Envia a resposta padrão se não caiu nos returns acima
-        if (response) {
-            await sendMessage(from, response);
-        }
+        if (response) await sendMessage(from, response);
     });
 }
 
 // =========================================
-// ROTAS DA API (WEBHOOK)
+// SERVER & WEBHOOK
 // =========================================
 app.get('/webhook', (req, res) => {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
-    if (mode === 'subscribe' && token === WEBHOOK_VERIFY_TOKEN) {
-        console.log('✅ Webhook verificado!');
-        res.status(200).send(challenge);
+    if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === WEBHOOK_VERIFY_TOKEN) {
+        res.status(200).send(req.query['hub.challenge']);
     } else {
         res.sendStatus(403);
     }
@@ -162,40 +139,19 @@ app.get('/webhook', (req, res) => {
 
 app.post('/webhook', async (req, res) => {
     const body = req.body;
-    if (body.object === 'whatsapp_business_account') {
-        try {
-            if (body.entry && body.entry[0].changes && body.entry[0].changes[0].value.messages) {
-                const value = body.entry[0].changes[0].value;
-                const messageData = value.messages[0];
-                const contactData = value.contacts ? value.contacts[0] : null;
-                
-                // Só processa se for mensagem de texto por enquanto
-                if (messageData.type === 'text') {
-                    const from = messageData.from;
-                    const msgBody = messageData.text.body;
-                    const name = contactData ? contactData.profile.name : 'Usuário';
+    if (body.object === 'whatsapp_business_account' && body.entry && body.entry[0].changes && body.entry[0].changes[0].value.messages) {
+        const msgData = body.entry[0].changes[0].value.messages[0];
+        if (msgData.type === 'text') {
+            const from = msgData.from;
+            const name = body.entry[0].changes[0].value.contacts[0].profile.name;
+            const text = msgData.text.body;
 
-                    console.log(`📩 ${name} (${from}) disse: ${msgBody}`);
+            console.log(`📩 ${name}: ${text}`);
 
-                    // 1. Salva/Atualiza o Lead no banco primeiro
-                    db.run(`INSERT INTO leads (phone, name, last_interaction) VALUES (?, ?, CURRENT_TIMESTAMP)
-                            ON CONFLICT(phone) DO UPDATE SET last_interaction=CURRENT_TIMESTAMP, name=excluded.name`, 
-                            [from, name], 
-                            (err) => {
-                                if (!err) {
-                                    // 2. Chama o Chatbot Financeiro
-                                    handleChatbot(from, msgBody, name);
-                                    
-                                    // 3. (Opcional) Salva o histórico da msg recebida
-                                    db.get("SELECT id FROM leads WHERE phone = ?", [from], (e, row) => {
-                                        if (row) db.run("INSERT INTO messages (lead_id, type, body) VALUES (?, 'received', ?)", [row.id, msgBody]);
-                                    });
-                                }
-                            });
-                }
-            }
-        } catch (e) {
-            console.error('Erro no webhook:', e);
+            // Garante que o lead existe antes de chamar o bot
+            db.run(`INSERT INTO leads (phone, name, last_interaction) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(phone) DO UPDATE SET last_interaction=CURRENT_TIMESTAMP, name=excluded.name`, [from, name], (err) => {
+                if (!err) handleChatbot(from, text, name);
+            });
         }
         res.sendStatus(200);
     } else {
@@ -203,20 +159,8 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
-// Rotas extras para o Dashboard (se ainda estiver usando)
-app.get('/api/leads', (req, res) => {
-    db.all("SELECT * FROM leads ORDER BY last_interaction DESC", [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-    });
-});
-app.get('/api/messages/:leadId', (req, res) => {
-    db.all("SELECT * FROM messages WHERE lead_id = ? ORDER BY timestamp ASC", [req.params.leadId], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-    });
-});
+// Rotas Dashboard (Opcionais)
+app.get('/api/leads', (req, res) => db.all("SELECT * FROM leads ORDER BY last_interaction DESC", [], (e, r) => res.json(r)));
+app.get('/api/messages/:id', (req, res) => db.all("SELECT * FROM messages WHERE lead_id = ?", [req.params.id], (e, r) => res.json(r)));
 
-app.listen(PORT, () => {
-    console.log(`🚀 Servidor Financeiro rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Bot Financeiro ON na porta ${PORT}`));
