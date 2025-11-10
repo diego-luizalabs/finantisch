@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp CRM MVP</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background: #f0f2f5; height: 100vh; }
+        .chat-container { height: calc(100vh - 50px); }
+        .leads-list { overflow-y: auto; height: 100%; }
+        .chat-area { display: flex; flex-direction: column; height: 100%; }
+        .messages-box { flex-grow: 1; overflow-y: auto; padding: 20px; background: #e5ddd5; }
+        .msg { padding: 10px 15px; border-radius: 15px; margin-bottom: 8px; max-width: 75%; word-wrap: break-word; }
+        .received { background: white; align-self: flex-start; border-bottom-left-radius: 5px; }
+        .sent { background: #dcf8c6; align-self: flex-end; border-bottom-right-radius: 5px; margin-left: auto; }
+        .lead-item { cursor: pointer; transition: 0.2s; }
+        .lead-item:hover, .lead-item.active { background-color: #e9ecef; }
+    </style>
+</head>
+<body>
+    <div class="container-fluid py-3 chat-container">
+        <div class="row h-100">
+            <div class="col-md-3 d-flex flex-column bg-white border-end">
+                <div class="p-3 border-bottom bg-success text-white">
+                    <h5 class="m-0">💬 Conversas</h5>
+                </div>
+                <div class="leads-list" id="leadsList">
+                    </div>
+            </div>
+
+            <div class="col-md-9 p-0 chat-area bg-light">
+                <div class="p-3 border-bottom bg-white" id="chatHeader">
+                    <strong>Selecione uma conversa</strong>
+                </div>
+                <div id="chatBox" class="messages-box d-flex flex-column">
+                    </div>
+                <div class="p-3 bg-white border-top">
+                    <div class="input-group">
+                        <input type="text" id="messageInput" class="form-control" placeholder="Digite sua mensagem..." disabled>
+                        <button class="btn btn-success" id="sendBtn" onclick="sendManualMessage()" disabled>Enviar</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <script>
+        let currentLead = null;
+
+        function formatTime(isoString) {
+            return new Date(isoString).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+
+        async function loadLeads() {
+            try {
+                const res = await axios.get('/api/leads');
+                const list = document.getElementById('leadsList');
+                list.innerHTML = res.data.map(lead => `
+                    <div class="lead-item p-3 border-bottom ${currentLead && currentLead.id === lead.id ? 'active' : ''}" 
+                         onclick='selectLead(${JSON.stringify(lead)})'>
+                        <div class="d-flex justify-content-between">
+                            <strong>${lead.name || lead.phone}</strong>
+                            <small class="text-muted">${formatTime(lead.last_interaction)}</small>
+                        </div>
+                        <small class="text-truncate d-block text-muted" style="max-width: 200px;">${lead.phone}</small>
+                    </div>
+                `).join('');
+            } catch (e) { console.error("Erro ao carregar leads", e); }
+        }
+
+        async function selectLead(lead) {
+            currentLead = lead;
+            document.getElementById('chatHeader').innerHTML = `<strong>${lead.name || lead.phone}</strong> <small>(${lead.phone})</small>`;
+            document.getElementById('messageInput').disabled = false;
+            document.getElementById('sendBtn').disabled = false;
+            loadMessages();
+            loadLeads(); // Atualiza seleção visual
+        }
+
+        async function loadMessages() {
+            if (!currentLead) return;
+            try {
+                const res = await axios.get(`/api/messages/${currentLead.id}`);
+                const chatBox = document.getElementById('chatBox');
+                chatBox.innerHTML = res.data.map(msg => `
+                    <div class="msg ${msg.type}">
+                        ${msg.body}
+                        <div class="text-end" style="font-size: 0.7em; opacity: 0.6;">
+                            ${formatTime(msg.timestamp)}
+                        </div>
+                    </div>
+                `).join('');
+                chatBox.scrollTop = chatBox.scrollHeight;
+            } catch (e) { console.error("Erro ao carregar mensagens", e); }
+        }
+
+        async function sendManualMessage() {
+            const input = document.getElementById('messageInput');
+            const text = input.value.trim();
+            if (!text || !currentLead) return;
+
+            input.value = '';
+            try {
+                // Exibe imediatamente a mensagem como "enviando" para melhor UX
+                const chatBox = document.getElementById('chatBox');
+                chatBox.innerHTML += `<div class="msg sent" style="opacity: 0.7">${text} <br><small>🕑 enviando...</small></div>`;
+                chatBox.scrollTop = chatBox.scrollHeight;
+
+                await axios.post('/api/send-message', { phone: currentLead.phone, message: text });
+                loadMessages(); // Recarrega para confirmar envio
+            } catch (e) {
+                alert('Erro ao enviar mensagem: ' + e.message);
+            }
+        }
+
+        // Pressionar Enter para enviar
+        document.getElementById('messageInput').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendManualMessage();
+        });
+
+        // Atualização automática a cada 3 segundos
+        setInterval(() => {
+            loadLeads();
+            if (currentLead) loadMessages();
+        }, 3000);
+
+        loadLeads();
+    </script>
+</body>
+</html>
