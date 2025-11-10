@@ -14,153 +14,168 @@ const PORT = process.env.PORT || 3000;
 const { GRAPH_API_TOKEN, PHONE_NUMBER_ID, GRAPH_API_VERSION, WEBHOOK_VERIFY_TOKEN } = process.env;
 
 // =========================================
-// FUNÇÃO AUXILIAR: ENVIO DE MENSAGEM
+// HELPERS
 // =========================================
-async function sendMessage(to, text) {
-    try {
-        await axios({
-            method: 'POST',
-            url: `https://graph.facebook.com/${GRAPH_API_VERSION}/${PHONE_NUMBER_ID}/messages`,
-            headers: {
-                'Authorization': `Bearer ${GRAPH_API_TOKEN}`,
-                'Content-Type': 'application/json'
-            },
-            data: {
-                messaging_product: 'whatsapp',
-                to: to,
-                text: { body: text }
-            }
-        });
-        // Log opcional no banco
-        db.get("SELECT id FROM leads WHERE phone = ?", [to], (err, row) => {
-            if (row) db.run("INSERT INTO messages (lead_id, type, body) VALUES (?, 'sent', ?)", [row.id, text]);
-        });
-    } catch (error) {
-        console.error('❌ Erro ao enviar mensagem:', error.response ? error.response.data : error.message);
+// Gera ID de 5 caracteres (Letras maiúsculas e números)
+function generateShortId() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let result = '';
+    for (let i = 0; i < 5; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
     }
+    return result;
+}
+
+// Envia Texto Simples
+async function sendText(to, text) {
+    try {
+        await axios.post(`https://graph.facebook.com/${GRAPH_API_VERSION}/${PHONE_NUMBER_ID}/messages`, {
+            messaging_product: 'whatsapp', to: to, type: 'text', text: { body: text }
+        }, { headers: { 'Authorization': `Bearer ${GRAPH_API_TOKEN}` }});
+    } catch (e) { console.error('Erro sendText:', e.response ? e.response.data : e.message); }
+}
+
+// Envia Mensagem COM BOTÃO Interativo
+async function sendInteractiveButton(to, bodyText, buttonLabel, buttonPayload) {
+    try {
+        await axios.post(`https://graph.facebook.com/${GRAPH_API_VERSION}/${PHONE_NUMBER_ID}/messages`, {
+            messaging_product: 'whatsapp',
+            to: to,
+            type: 'interactive',
+            interactive: {
+                type: 'button',
+                body: { text: bodyText },
+                action: {
+                    buttons: [
+                        {
+                            type: 'reply',
+                            reply: {
+                                id: buttonPayload, // O ID escondido que o bot vai ler quando clicarem
+                                title: buttonLabel // O texto que aparece no botão para o usuário
+                            }
+                        }
+                    ]
+                }
+            }
+        }, { headers: { 'Authorization': `Bearer ${GRAPH_API_TOKEN}` }});
+    } catch (e) { console.error('Erro sendInteractiveButton:', e.response ? e.response.data : e.message); }
 }
 
 // =========================================
-// 🐷 BOT FINANCEIRO (LÓGICA PRINCIPAL)
+// 🧠 CÉREBRO DO BOT FINANCEIRO V2
 // =========================================
-async function handleChatbot(from, msgBody, leadName) {
-    msgBody = msgBody.trim();
+async function handleChatbot(from, msgBody, isButton = false, buttonId = null, leadName = '') {
+    if (!isButton) msgBody = msgBody.trim();
     const lowerMsg = msgBody.toLowerCase();
 
-    // 1. Identifica o usuário no banco
     db.get("SELECT id FROM leads WHERE phone = ?", [from], async (err, lead) => {
         if (err || !lead) return;
 
-        let response = "";
+        // --- 1. CLICK NO BOTÃO "EXCLUIR" ---
+        if (isButton && buttonId.startsWith('del_')) {
+            const idParaExcluir = buttonId.split('_')[1]; // Pega o ID depois do "del_"
+            db.run("DELETE FROM transactions WHERE short_id = ? AND lead_id = ?", [idParaExcluir, lead.id], function(err) {
+                if (this.changes > 0) {
+                    sendText(from, `🗑️ Lançamento *${idParaExcluir}* excluído para sempre.`);
+                } else {
+                    sendText(from, `⚠️ O lançamento *${idParaExcluir}* já foi excluído ou não existe mais.`);
+                }
+            });
+            return;
+        }
 
-        // --- COMANDO: CONTROLE (ADICIONAR) ---
-        if (lowerMsg.startsWith('controle ')) {
-            const parts = msgBody.split(' ');
-            const valor = parseFloat(parts[1] ? parts[1].replace(',', '.') : '0');
-            const categoria = parts.slice(2).join(' ') || 'geral';
+        // --- 2. DETECTA GASTO IMPLÍCITO (Ex: "50.90 mercado") ---
+        // Regex: Começa com numero, pode ter virgula/ponto, espaço, e depois texto.
+        const matchGasto = msgBody.match(/^(\d+([.,]\d+)?)\s+(.+)/);
 
-            if (isNaN(valor) || valor <= 0) {
-                response = "❌ *Valor inválido.*\nUse: _controle 50.00 mercado_";
-            } else {
-                db.run(`INSERT INTO transactions (lead_id, amount, category) VALUES (?, ?, ?)`, 
-                    [lead.id, valor, categoria], function (err) {
+        if (matchGasto && !isButton) {
+            const valor = parseFloat(matchGasto[1].replace(',', '.'));
+            const categoria = matchGasto[3];
+            const novoId = generateShortId();
+
+            if (!isNaN(valor) && valor > 0) {
+                db.run(`INSERT INTO transactions (lead_id, short_id, amount, category) VALUES (?, ?, ?, ?)`, 
+                    [lead.id, novoId, valor, categoria], (err) => {
                         if (!err) {
-                            sendMessage(from, `✅ *Registrado!*\n🆔 ID: ${this.lastID}\n💰 R$${valor.toFixed(2)}\n📂 ${categoria}`);
+                            // ✨ A MÁGICA: Manda a confirmação JÁ com o botão de excluir
+                            const msgConfirmacao = `✅ *Registrado!*\n🆔 ID: ${novoId}\n💰 R$${valor.toFixed(2)}\n📂 ${categoria}`;
+                            sendInteractiveButton(from, msgConfirmacao, "Excluir ❌", `del_${novoId}`);
                         } else {
-                            sendMessage(from, "❌ Erro ao salvar. Tente novamente.");
+                            sendText(from, "❌ Erro ao salvar no banco de dados.");
                         }
                     });
                 return;
             }
-
-        // --- COMANDO: EXTRATO (SALDO) ---
-        } else if (['extrato', 'saldo', 'ver', 'total'].includes(lowerMsg)) {
-            // Calcula Total
-            db.get("SELECT SUM(amount) as total FROM transactions WHERE lead_id = ?", [lead.id], (err, resTotal) => {
-                const total = resTotal && resTotal.total ? resTotal.total : 0;
-                
-                // Busca últimos 10 lançamentos
-                db.all("SELECT id, amount, category, created_at FROM transactions WHERE lead_id = ? ORDER BY id DESC LIMIT 10", [lead.id], async (err, rows) => {
-                    let msg = `🐷 *EXTRATO FINANCEIRO*\n\n💰 *SALDO TOTAL: R$${total.toFixed(2)}*\n──────────────────\n`;
-                    
-                    if (rows.length > 0) {
-                        rows.forEach(t => {
-                            // Formatação de Data BR (Gambiarra funcional para SQLite UTC)
-                            // Assume que o servidor salva em UTC. Adiciona 'Z' para o JS entender que é UTC.
-                            let dataBR = '---';
-                            try {
-                                const dataUTC = new Date(t.created_at.replace(' ', 'T') + 'Z');
-                                dataBR = dataUTC.toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' });
-                            } catch (e) { dataBR = t.created_at; } // Fallback se der erro na data
-
-                            msg += `🆔*${t.id}* | R$${t.amount.toFixed(2)}\n📂 ${t.category} | 🕒 ${dataBR}\n\n`;
-                        });
-                    } else {
-                        msg += "(Nenhum lançamento ainda)\n";
-                    }
-                    msg += `💡 _Para apagar: *excluir [ID]*_`;
-                    await sendMessage(from, msg);
-                });
-            });
-            return;
-
-        // --- COMANDO: EXCLUIR ---
-        } else if (lowerMsg.startsWith('excluir ')) {
-            const idExcluir = parseInt(lowerMsg.split(' ')[1]);
-            if (!isNaN(idExcluir)) {
-                db.run("DELETE FROM transactions WHERE id = ? AND lead_id = ?", [idExcluir, lead.id], function(err) {
-                    if (this.changes > 0) sendMessage(from, `🗑️ Lançamento *ID ${idExcluir}* apagado!`);
-                    else sendMessage(from, `⚠️ ID ${idExcluir} não encontrado.`);
-                });
-                return;
-            } else {
-                response = "❌ Use: *excluir [NÚMERO DO ID]*";
-            }
-
-        // --- MENU PADRÃO ---
-        } else {
-            response = `🐷 *Bot Financeiro*\nOlá ${leadName}! Seus comandos:\n\n🆕 *controle [valor] [descrição]*\n_(Ex: controle 100 jantar fora)_\n\n📊 *extrato*\n_(Ver saldo e histórico)_\n\n❌ *excluir [ID]*\n_(Apagar um registro)_`;
         }
 
-        if (response) await sendMessage(from, response);
+        // --- 3. OUTROS COMANDOS ---
+        if (['extrato', 'saldo', 'ver'].includes(lowerMsg)) {
+            db.get("SELECT SUM(amount) as total FROM transactions WHERE lead_id = ?", [lead.id], (err, res) => {
+                const total = res && res.total ? res.total : 0;
+                db.all("SELECT short_id, amount, category, created_at FROM transactions WHERE lead_id = ? ORDER BY id DESC LIMIT 10", [lead.id], async (err, rows) => {
+                    let msg = `🐷 *EXTRATO*\n💰 *TOTAL: R$${total.toFixed(2)}*\n────────────────\n`;
+                    rows.forEach(t => {
+                        // Formata data BR
+                        let dataBR = t.created_at;
+                        try {
+                             dataBR = new Date(t.created_at.replace(' ', 'T') + 'Z')
+                                .toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' });
+                        } catch(e) {}
+                        msg += `🆔 ${t.short_id} | R$${t.amount.toFixed(2)}\n📂 ${t.category} (${dataBR})\n\n`;
+                    });
+                    msg += `_Para excluir manualmente, use: excluir [ID]_`;
+                    await sendText(from, msg);
+                });
+            });
+
+        } else if (lowerMsg.startsWith('excluir ')) {
+            // Exclusão manual pelo texto (caso não queira usar o botão)
+            const idExcluir = msgBody.split(' ')[1];
+            handleChatbot(from, '', true, `del_${idExcluir}`, leadName); // Reutiliza a lógica do botão
+
+        } else if (!isButton) {
+            // Menu padrão se não entendeu nada
+            sendText(from, `🐷 *Bot Cofrinho*\n\nSimplesmente digite o valor e a descrição para salvar.\n\nExemplos:\n👉 *50 almoço*\n👉 *15.90 uber*\n👉 *100 cinema*\n\nOutros comandos:\n📊 *extrato*`);
+        }
     });
 }
 
 // =========================================
-// SERVER & WEBHOOK
+// WEBHOOK
 // =========================================
 app.get('/webhook', (req, res) => {
     if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === WEBHOOK_VERIFY_TOKEN) {
         res.status(200).send(req.query['hub.challenge']);
-    } else {
-        res.sendStatus(403);
-    }
+    } else { res.sendStatus(403); }
 });
 
 app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (body.object === 'whatsapp_business_account' && body.entry && body.entry[0].changes && body.entry[0].changes[0].value.messages) {
-        const msgData = body.entry[0].changes[0].value.messages[0];
-        if (msgData.type === 'text') {
-            const from = msgData.from;
-            const name = body.entry[0].changes[0].value.contacts[0].profile.name;
-            const text = msgData.text.body;
+        const changes = body.entry[0].changes[0].value;
+        const msgData = changes.messages[0];
+        const contact = changes.contacts ? changes.contacts[0] : null;
+        const from = msgData.from;
+        const name = contact ? contact.profile.name : 'Usuário';
 
-            console.log(`📩 ${name}: ${text}`);
-
-            // Garante que o lead existe antes de chamar o bot
-            db.run(`INSERT INTO leads (phone, name, last_interaction) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(phone) DO UPDATE SET last_interaction=CURRENT_TIMESTAMP, name=excluded.name`, [from, name], (err) => {
-                if (!err) handleChatbot(from, text, name);
-            });
-        }
+        // Garante que o lead existe
+        db.run(`INSERT INTO leads (phone, name, last_interaction) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(phone) DO UPDATE SET last_interaction=CURRENT_TIMESTAMP, name=excluded.name`, [from, name], (err) => {
+            if (!err) {
+                // TIPO 1: Mensagem de texto normal
+                if (msgData.type === 'text') {
+                    console.log(`📩 Texto de ${name}: ${msgData.text.body}`);
+                    handleChatbot(from, msgData.text.body, false, null, name);
+                }
+                // TIPO 2: Clique em botão (Interactive)
+                else if (msgData.type === 'interactive' && msgData.interactive.type === 'button_reply') {
+                    const buttonId = msgData.interactive.button_reply.id;
+                    console.log(`🔘 Botão clicado por ${name}: ${buttonId}`);
+                    handleChatbot(from, '', true, buttonId, name);
+                }
+            }
+        });
         res.sendStatus(200);
-    } else {
-        res.sendStatus(404);
-    }
+    } else { res.sendStatus(404); }
 });
 
-// Rotas Dashboard (Opcionais)
-app.get('/api/leads', (req, res) => db.all("SELECT * FROM leads ORDER BY last_interaction DESC", [], (e, r) => res.json(r)));
-app.get('/api/messages/:id', (req, res) => db.all("SELECT * FROM messages WHERE lead_id = ?", [req.params.id], (e, r) => res.json(r)));
-
-app.listen(PORT, () => console.log(`🚀 Bot Financeiro ON na porta ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Bot Financeiro V2 rodando na porta ${PORT}`));
